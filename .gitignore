@@ -1,0 +1,13 @@
+# Python venv
+rag/
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
