@@ -1,56 +1,47 @@
 #!/usr/bin/env python3
 """
-ADAPTIVE HYBRID RETRIEVAL CHAT INTERFACE
-- Query analysis determines complexity
-- Dynamic top_k (3-10 based on query)
-- Multi-query expansion for complex questions
-- BM25 + Vector hybrid search
+SELF-CORRECTING CHAT INTERFACE
+Integrates self-correction loop into the adaptive retrieval pipeline
 """
 import os
 import sys
 import chromadb
 from dotenv import load_dotenv
 from groq import Groq
-
-from llama_index.core import VectorStoreIndex
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.retrievers.bm25 import BM25Retriever
-from llama_index.core import QueryBundle
-from llama_index.core.schema import TextNode
-
-# Import adaptive retriever
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from pipeline.adaptive_retriever import AdaptiveRetriever
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
-
-# Import BM25 caching utilities (from previous chat_03.py)
 from pathlib import Path
 import hashlib
 import pickle
 
+from llama_index.core import VectorStoreIndex, QueryBundle
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.schema import TextNode
+
+# Import our components
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from pipeline.adaptive_retriever import AdaptiveRetriever
+from pipeline.grader import AnswerGrader
+from pipeline.corrector import CorrectionStrategies
+from pipeline.self_correcting_engine import create_self_correcting_engine
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
+
 
 def hybrid_retrieve(vector_retriever, bm25_retriever, query_str, top_k=5):
-    """
-    Hybrid BM25 + Vector retrieval with score combination.
-    This is the base retrieval function that adaptive retriever will use.
-    """
+    """Hybrid BM25 + Vector retrieval."""
     query_bundle = QueryBundle(query_str=query_str)
     vector_nodes = vector_retriever.retrieve(query_bundle)
     
-    # If BM25 is not available, just use vector results
     if bm25_retriever is None:
         return vector_nodes[:top_k]
     
     bm25_nodes = bm25_retriever.retrieve(query_bundle)
     
-    # Initialize score dictionary
     node_scores = {}
     
-    # Add vector scores (already 0-1 from cosine similarity)
     for node in vector_nodes:
         node_id = node.node_id
         node_scores[node_id] = {
@@ -59,7 +50,6 @@ def hybrid_retrieve(vector_retriever, bm25_retriever, query_str, top_k=5):
             'bm25_score': 0.0
         }
     
-    # Normalize and add BM25 scores
     if bm25_nodes:
         max_bm25 = max(node.score for node in bm25_nodes)
         min_bm25 = min(node.score for node in bm25_nodes)
@@ -78,7 +68,6 @@ def hybrid_retrieve(vector_retriever, bm25_retriever, query_str, top_k=5):
                     'bm25_score': normalized_bm25
                 }
     
-    # Combine scores (60% vector, 40% BM25)
     combined_nodes = []
     for node_id, scores in node_scores.items():
         combined_score = (0.6 * scores['vector_score']) + (0.4 * scores['bm25_score'])
@@ -86,13 +75,12 @@ def hybrid_retrieve(vector_retriever, bm25_retriever, query_str, top_k=5):
         node.score = combined_score
         combined_nodes.append(node)
     
-    # Sort by combined score and return top_k
     combined_nodes.sort(key=lambda x: x.score, reverse=True)
     return combined_nodes[:top_k]
 
 
 def compute_documents_hash(doc_texts):
-    """SHA256 hash of document texts for cache validation."""
+    """SHA256 hash of document texts."""
     if not doc_texts:
         return "empty"
     combined = "".join(doc_texts).encode("utf-8")
@@ -113,11 +101,11 @@ def save_bm25_cache(bm25_retriever, doc_texts, cache_dir):
     with open(cache_dir / "bm25_retriever.pkl", "wb") as f:
         pickle.dump({"similarity_top_k": bm25_retriever.similarity_top_k}, f)
     
-    print(f"💾 BM25 cache saved to {cache_dir}")
+    print(f"💾 BM25 cache saved")
 
 
 def load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10):
-    """Load BM25 index from cache if hash matches."""
+    """Load BM25 index from cache."""
     cache_dir = Path(cache_dir)
     hash_file = cache_dir / "bm25_hash.txt"
     index_dir = cache_dir / "bm25_index"
@@ -125,7 +113,6 @@ def load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10):
     if not hash_file.exists() or not index_dir.exists():
         return None
     
-    # Verify hash
     with open(hash_file, "r") as f:
         saved_hash = f.read().strip()
     current_hash = compute_documents_hash(doc_texts)
@@ -134,7 +121,6 @@ def load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10):
         print("🔄 Document hash changed – rebuilding BM25...")
         return None
     
-    # Load BM25 index
     try:
         import bm25s
         
@@ -147,42 +133,16 @@ def load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10):
         
         retriever = BM25Retriever.from_defaults(
             nodes=nodes,
-            similarity_top_k=similarity_top_k,
-            #bm25=bm25
+            similarity_top_k=similarity_top_k
         )
+        # Manually set the BM25 index
+        retriever.bm25 = bm25
+        
         print(f"✅ Loaded BM25 index from cache ({len(doc_texts)} documents)")
         return retriever
     except Exception as e:
         print(f"⚠️  Failed to load BM25 cache: {e}")
         return None
-
-
-def format_clauses_for_context(nodes, max_clauses=5):
-    """Format retrieved nodes into clean context."""
-    context_parts = []
-    clause_info = []
-    
-    for i, node in enumerate(nodes[:max_clauses]):
-        clause_number = node.metadata.get('clause_number', 'Unknown')
-        clause_title = node.metadata.get('clause_title', 'Unknown Section')
-        filename = node.metadata.get('filename', 'Unknown Document')
-        score = node.score
-        
-        clause_header = f"[CLAUSE {clause_number}: {clause_title}]"
-        clause_text = node.text
-        
-        context_parts.append(f"{clause_header}\n{clause_text}")
-        
-        clause_info.append({
-            'number': clause_number,
-            'title': clause_title,
-            'filename': filename,
-            'score': score,
-            'text_preview': clause_text[:150] + "..." if len(clause_text) > 150 else clause_text
-        })
-    
-    context_str = "\n\n---\n\n".join(context_parts)
-    return context_str, clause_info
 
 
 def detect_language(text):
@@ -228,19 +188,15 @@ def main():
     load_dotenv()
     
     print("=" * 70)
-    print("☀️  SOLAR PPA LEGAL ASSISTANT - ADAPTIVE RETRIEVAL")
+    print("☀️  SOLAR PPA LEGAL ASSISTANT - SELF-CORRECTING")
     print("=" * 70)
-    print("🔬 Mode: Adaptive Query-Aware Hybrid Search")
+    print("🔬 Mode: Adaptive Retrieval + Self-Correction Loop")
     print("=" * 70)
     
     # 1. Load embedding model
-    print("\n🔄 Loading BGE-M3 (1024-dim)...")
-    try:
-        embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
-        print("✅ Embedding model ready")
-    except Exception as e:
-        print(f"❌ Failed to load embeddings: {e}")
-        return
+    print("\n🔄 Loading BGE-M3...")
+    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
+    print("✅ Embedding model ready")
     
     # 2. Connect to ChromaDB
     print(f"📁 Chroma DB: {CHROMA_DB_PATH}")
@@ -254,25 +210,23 @@ def main():
         if count == 0:
             print("⚠️  Collection is empty!")
             return
-            
     except Exception as e:
         print(f"❌ Collection not found: {e}")
         return
     
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     
-    # 3. Build index and base retrievers
+    # 3. Build index and retrievers
     print("🔄 Building index and retrievers...")
     index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
     
-    # Base vector retriever
     vector_retriever = VectorIndexRetriever(
         index=index,
         similarity_top_k=10,
         embed_model=embed_model
     )
     
-    # BM25 retriever with caching
+    # Build BM25
     print("🔄 Building BM25 index...")
     all_docs = chroma_collection.get(include=["documents", "metadatas"])
     ids = all_docs["ids"]
@@ -280,12 +234,11 @@ def main():
     metadatas = all_docs["metadatas"]
     
     if not doc_texts:
-        print("⚠️  No documents found for BM25 – using vector only")
+        print("⚠️  No documents for BM25")
         bm25_retriever = None
     else:
         cache_dir = os.path.join(PROJECT_ROOT, "cache", "bm25_cache")
-        
-        bm25_retriever = load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10)
+        bm25_retriever = load_bm25_cache(cache_dir, doc_texts, ids, metadatas, 10)
         
         if bm25_retriever is None:
             print("🔄 Building fresh BM25 index...")
@@ -297,25 +250,21 @@ def main():
             bm25_retriever = BM25Retriever.from_defaults(
                 nodes=nodes,
                 similarity_top_k=10,
-                verbose=True
+                verbose=False
             )
             save_bm25_cache(bm25_retriever, doc_texts, cache_dir)
-            print(f"✅ BM25 index built and cached ({len(nodes)} nodes)")
     
-    # 4. Initialize Groq clients
+    # 4. Initialize Groq
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         print("❌ GROQ_API_KEY not found")
         return
     
-    # Analysis LLM (temperature=0.0 for consistent classification)
     analysis_llm = Groq(api_key=groq_api_key)
     
-    # Answer generation client (temperature=0.1 for slight creativity)
-    answer_client = Groq(api_key=groq_api_key)
-    
+    # Test API
     try:
-        test = answer_client.chat.completions.create(
+        test = analysis_llm.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": "Say OK"}],
             max_tokens=10
@@ -332,15 +281,41 @@ def main():
         vector_retriever=vector_retriever,
         bm25_retriever=bm25_retriever,
         analysis_llm=analysis_llm,
-        verbose=True  # Show analysis in console
+        verbose=False  # Disable verbose for cleaner output
     )
-    print("✅ Adaptive retriever ready")
     
-    # 6. Chat loop
+    # 6. Create self-correcting query engine
+    print("🔄 Creating self-correcting query engine...")
+    
+    # Ask user if they want correction enabled
+    enable_correction_input = input("Enable self-correction? (y/n, default=y): ").strip().lower()
+    enable_correction = enable_correction_input != 'n'
+    
+    if enable_correction:
+        print("✅ Self-correction ENABLED (max 2 attempts)")
+    else:
+        print("⚠️  Self-correction DISABLED (baseline mode)")
+    
+    query_engine = create_self_correcting_engine(
+        retriever=adaptive_retriever,
+        groq_api_key=groq_api_key,
+        system_prompt=get_system_prompt('en'),  # Default English
+        enable_correction=enable_correction,
+        max_correction_attempts=2,
+        faithfulness_threshold=0.9,
+        relevancy_threshold=0.8,
+        verbose=True  # Show correction process
+    )
+    
+    print("✅ Query engine ready")
+    
+    # 7. Chat loop
     print("\n" + "=" * 70)
-    print("💬 Ready! Adaptive retrieval active.")
-    print("   Query complexity will be analyzed automatically")
-    print("   Complex queries will use multi-query expansion")
+    if enable_correction:
+        print("💬 Ready! Self-correction active.")
+        print("   Answers will be automatically graded and corrected if needed")
+    else:
+        print("💬 Ready! Baseline mode (no correction)")
     print("=" * 70 + "\n")
     
     while True:
@@ -354,81 +329,43 @@ def main():
                 print("\n👋 Goodbye!")
                 break
             
-            # ADAPTIVE RETRIEVAL
-            print(f"\n🔍 Adaptive retrieval...")
+            # Query using self-correcting engine
+            response = query_engine.query(query)
             
-            try:
-                query_bundle = QueryBundle(query_str=query)
-                nodes = adaptive_retriever.retrieve(query_bundle)
-            except Exception as e:
-                print(f"⚠️  Adaptive retrieval error: {e}")
-                print("Falling back to standard hybrid retrieval...")
-                nodes = hybrid_retrieve(vector_retriever, bm25_retriever, query, top_k=5)
+            answer = response.response
+            metadata = response.metadata
             
-            if len(nodes) == 0:
-                print("❌ No relevant clauses found.")
-                continue
+            # Display answer
+            print("\n" + "=" * 70)
+            print("📢 ANSWER:")
+            print("=" * 70)
+            print(answer)
+            print("=" * 70)
             
-            # Filter by threshold
-            relevant_nodes = [n for n in nodes if n.score > 0.5]
-            if not relevant_nodes:
-                print("⚠️  No clauses meet relevance threshold (>0.5)")
-                continue
-            
-            print(f"✅ Final result: {len(relevant_nodes)} relevant clause(s)")
-            
-            # Format context
-            context, clause_info = format_clauses_for_context(relevant_nodes, max_clauses=5)
-            
-            top_clause = clause_info[0]
-            print(f"\n📋 Top clause:")
-            print(f"   Clause {top_clause['number']}: {top_clause['title']}")
-            print(f"   Score: {top_clause['score']:.3f}")
-            print(f"   Preview: {top_clause['text_preview']}")
-            
-            # Detect language and generate answer
-            language = detect_language(query)
-            system_prompt = get_system_prompt(language)
-            
-            print(f"\n🤖 Generating answer...")
-            
-            try:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user", 
-                        "content": f"PROVIDED CLAUSES:\n\n{context}\n\n---\n\nUSER QUESTION: {query}"
-                    }
-                ]
+            # Display metadata
+            if enable_correction and metadata.get('correction_enabled'):
+                print(f"\n📊 Quality Metrics:")
+                print(f"   Correction attempts: {metadata['correction_attempts']}")
+                if metadata['corrections_made']:
+                    print(f"   Corrections made: {', '.join(metadata['corrections_made'])}")
+                print(f"   Final faithfulness: {metadata['final_grading']['faithfulness']:.3f}")
+                print(f"   Final relevancy: {metadata['final_grading']['relevancy']:.3f}")
                 
-                completion = answer_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=800
-                )
-                
-                answer = completion.choices[0].message.content.strip()
-                
-                if not answer:
-                    print("⚠️  Empty response from LLM")
-                    continue
-                
-                print("\n" + "=" * 70)
-                print("📢 ANSWER:")
-                print("=" * 70)
-                print(answer)
-                print("=" * 70)
-                
-                print(f"\n📚 Sources ({len(clause_info)} clauses):")
-                for info in clause_info:
-                    print(f"   • Clause {info['number']}: {info['title']}")
-                    print(f"     Score: {info['score']:.3f}")
-                
-                print("")
-                
-            except Exception as e:
-                print(f"❌ Groq API error: {e}")
+                if metadata['correction_success']:
+                    print(f"   ✅ Answer meets quality standards")
+                else:
+                    print(f"   ⚠️  Answer did not fully meet standards after {metadata['correction_attempts']} attempts")
+            
+            # Display sources
+            if response.source_nodes:
+                print(f"\n📚 Sources ({len(response.source_nodes)} clauses):")
+                for node in response.source_nodes[:3]:
+                    clause_num = node.metadata.get('clause_number', '?')
+                    clause_title = node.metadata.get('clause_title', 'Unknown')
+                    print(f"   • Clause {clause_num}: {clause_title}")
+                    print(f"     Score: {node.score:.3f}")
+            
+            print("")
             
         except KeyboardInterrupt:
             print("\n\n👋 Interrupted!")
