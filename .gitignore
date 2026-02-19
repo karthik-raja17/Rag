@@ -15,6 +15,7 @@ Dataset/
 cache/
 *.db
 *.sqlite3
+documentation/
 
 # --- Vector Database ---
 # ChromaDB stores its index here; usually too large for Git
