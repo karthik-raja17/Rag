@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-CORRECTION STRATEGIES
-Implements re-retrieval and answer refinement for self-correction
+FIXED CORRECTOR - Conservative refinement that avoids adding unsupported claims
+Key fix: Emphasizes REMOVAL of bad content, not ADDITION of "better" content
+Includes CorrectionLoop class (copied from original) to avoid circular import.
 """
 import json
 import re
@@ -11,20 +12,13 @@ from langchain_ollama import ChatOllama
 
 class CorrectionStrategies:
     """
-    Implements correction strategies for failed quality checks:
-    1. Re-retrieval: Reformulate query to get better context
-    2. Answer Refinement: Rewrite answer to be more relevant/faithful
+    Conservative correction strategies that fix the over-elaboration problem.
     """
     
     def __init__(self, model_name: str = "qwen2.5:7b", verbose: bool = False):
-        """
-        Args:
-            model_name: Ollama model for corrections
-            verbose: Print correction details
-        """
         self.llm = ChatOllama(
             model=model_name,
-            temperature=0.3,  # Slight creativity for reformulation
+            temperature=0.3,
             num_predict=512,
             num_ctx=4096,
         )
@@ -35,18 +29,7 @@ class CorrectionStrategies:
         original_question: str,
         grading_feedback: Dict[str, any]
     ) -> List[str]:
-        """
-        Generate alternative query formulations to retrieve better context.
-        
-        Used when faithfulness is low (answer not grounded in retrieved context).
-        
-        Args:
-            original_question: Original user question
-            grading_feedback: Output from grade_answer()
-        
-        Returns:
-            List of 2-3 reformulated queries
-        """
+        """Generate alternative query formulations (unchanged from original)."""
         faithfulness_info = grading_feedback.get('faithfulness', {})
         unsupported_claims = faithfulness_info.get('unsupported_claims', [])
         
@@ -85,7 +68,6 @@ Respond ONLY with valid JSON (no markdown):
             result = json.loads(content)
             queries = result.get('reformulated_queries', [])
             
-            # Ensure we have at least the original
             if not queries:
                 queries = [original_question]
             
@@ -94,13 +76,11 @@ Respond ONLY with valid JSON (no markdown):
                 for i, q in enumerate(queries, 1):
                     print(f"   {i}. {q}")
             
-            return queries[:3]  # Max 3
+            return queries[:3]
             
         except Exception as e:
             if self.verbose:
-                print(f"⚠️  Query reformulation failed: {e}")
-            
-            # Fallback: return original
+                print(f"⚠️  Reformulation failed: {e}")
             return [original_question]
     
     def refine_answer(
@@ -111,40 +91,33 @@ Respond ONLY with valid JSON (no markdown):
         grading_feedback: Dict[str, any]
     ) -> str:
         """
-        Refine answer to improve relevancy or faithfulness.
-        
-        Args:
-            question: Original question
-            original_answer: Answer that failed quality check
-            contexts: Retrieved context chunks
-            grading_feedback: Output from grade_answer()
-        
-        Returns:
-            Refined answer string
+        FIXED: Refine answer with emphasis on REMOVAL, not addition.
         """
         correction_type = grading_feedback.get('correction_type', 'both')
         relevancy_info = grading_feedback.get('relevancy', {})
         faithfulness_info = grading_feedback.get('faithfulness', {})
         
-        # Build guidance based on what failed
+        # Build guidance
         guidance = []
         
         if correction_type in ['faithfulness', 'both']:
             unsupported = faithfulness_info.get('unsupported_claims', [])
             if unsupported:
                 guidance.append(f"REMOVE these unsupported claims: {', '.join(unsupported[:2])}")
-            guidance.append("ONLY use information directly stated in the provided context")
+            guidance.append("ONLY use information EXPLICITLY stated in context")
+            guidance.append("DO NOT add elaborations or interpretations")
         
         if correction_type in ['relevancy', 'both']:
             missing = relevancy_info.get('missing_aspects', [])
             if missing:
-                guidance.append(f"ADDRESS these missing aspects: {', '.join(missing[:2])}")
-            guidance.append("Focus DIRECTLY on answering the specific question asked")
+                guidance.append(f"ADDRESS these aspects if found in context: {', '.join(missing[:2])}")
+            guidance.append("Focus on the SPECIFIC question asked")
         
         guidance_str = "\n".join(f"- {g}" for g in guidance)
         
         context_str = "\n\n---\n\n".join(contexts)
         
+        # FIXED PROMPT - emphasizes removal, not addition
         prompt = f"""You are refining a legal answer that failed quality checks.
 
 QUESTION: {question}
@@ -155,17 +128,32 @@ RETRIEVED CONTEXT:
 ORIGINAL ANSWER (has quality issues):
 {original_answer}
 
-REFINEMENT GUIDANCE:
+IDENTIFIED PROBLEMS:
 {guidance_str}
 
-TASK: Rewrite the answer to fix the quality issues while maintaining accuracy.
+CRITICAL REFINEMENT RULES:
+1. ONLY use information EXPLICITLY stated in context
+2. REMOVE any claims not in context - DO NOT REPLACE THEM
+3. DO NOT add explanations, interpretations, or elaborations
+4. DO NOT add details to "improve" the answer
+5. Answer can be SHORTER than original - that's OK!
+6. Cite exact clause numbers from context
+7. If unsure or info missing: "I cannot find this information in the provided clauses"
+8. CONSERVATIVE is better than COMPREHENSIVE
 
-REQUIREMENTS:
-1. Answer MUST be grounded in the provided context (cite clause numbers)
-2. Answer MUST directly address the question
-3. Keep the answer concise and professional
-4. Remove any information not in the context
-5. Ensure all aspects of the question are covered
+EXAMPLES OF GOOD REFINEMENT:
+
+Bad Original: "The Default Rate is 12% per annum, compounded quarterly."
+Context: "The Default Rate is identified in the Key Information Table."
+Good Refinement: "The Default Rate is identified in the Key Information Table."
+→ REMOVED unsupported details (12%, quarterly)
+
+Bad Original: "The Buyer must design, install, operate, and maintain the Grid at their own expense."
+Context: "The Buyer is responsible for the Grid."
+Good Refinement: "The Buyer is responsible for the Grid."
+→ REMOVED elaborations (design, install, expense)
+
+TASK: Fix the answer by REMOVING problems. DO NOT make it "better" by adding content.
 
 Provide ONLY the refined answer (no preamble, no explanation):
 """
@@ -174,31 +162,34 @@ Provide ONLY the refined answer (no preamble, no explanation):
             response = self.llm.invoke(prompt)
             refined = response.content.strip()
             
-            # Remove potential markdown or meta-text
+            # Remove meta-text
             refined = re.sub(r'^(Refined answer:|Answer:)\s*', '', refined, flags=re.IGNORECASE)
             refined = refined.strip()
             
             if self.verbose:
                 print(f"\n✏️  Refined Answer:")
-                print(f"   {refined[:150]}...")
+                print(f"   Original length: {len(original_answer)} chars")
+                print(f"   Refined length: {len(refined)} chars")
+                if len(refined) < len(original_answer):
+                    print(f"   → Shortened (good! removed unsupported content)")
+                elif len(refined) > len(original_answer) * 1.2:
+                    print(f"   ⚠️  WARNING: Got longer (may have added content)")
             
             return refined
             
         except Exception as e:
             if self.verbose:
-                print(f"⚠️  Answer refinement failed: {e}")
-            
-            # Fallback: return original
+                print(f"⚠️  Refinement failed: {e}")
             return original_answer
     
     def _clean_json(self, text: str) -> str:
-        """Remove markdown formatting from JSON response."""
+        """Remove markdown formatting."""
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
-        text = text.strip()
-        return text
+        return text.strip()
 
 
+# ===== CorrectionLoop class (copied from original corrector.py) =====
 class CorrectionLoop:
     """
     Orchestrates the self-correction process with retry limits.
@@ -362,35 +353,40 @@ class CorrectionLoop:
         }
 
 
-# Example usage
+# Test
 if __name__ == "__main__":
-    from grader import AnswerGrader
+    # Import the fixed grader – you need to create this file separately or adapt
+    from grader import AnswerGrader  # Adjust import as needed
+    import os
+    from dotenv import load_dotenv
     
-    print("=" * 80)
-    print("🧪 TESTING CORRECTION STRATEGIES")
-    print("=" * 80)
+    load_dotenv()
     
-    grader = AnswerGrader(verbose=True)
+    groq_key = os.getenv("GROQ_API_KEY")
+    
+    grader = AnswerGrader(groq_api_key=groq_key, verbose=True)
     corrector = CorrectionStrategies(verbose=True)
-    loop = CorrectionLoop(grader, corrector, max_attempts=2, verbose=True)
+    loop = CorrectionLoop(grader, corrector, max_attempts=2, verbose=True,
+                          faithfulness_threshold=0.95, relevancy_threshold=0.85)
     
-    # Test case: Answer with low relevancy
+    print("=" * 80)
+    print("🧪 TESTING FIXED CORRECTOR")
+    print("=" * 80)
+    
+    # Test: Answer with unsupported elaboration
     question = "What is the Default Rate?"
-    answer = "The Buyer must maintain the Grid connection."  # Irrelevant
+    answer = "The Default Rate is 12% per annum, compounded quarterly, as defined in the agreement."
     contexts = [
-        "Definition of Default Rate: 'Default Rate' means the interest rate identified in the Key Information Table.",
-        "The Buyer shall be responsible for the Grid connection."
+        "Definition of Default Rate: 'Default Rate' means the interest rate identified in the Key Information Table."
     ]
     
     result = loop.correct_answer(question, answer, contexts)
     
     print("\n" + "=" * 80)
-    print("FINAL RESULT")
+    print("RESULT")
     print("=" * 80)
-    print(f"Success: {result['success']}")
+    print(f"Original answer: {answer}")
+    print(f"\nFinal answer: {result['final_answer']}")
+    print(f"\nSuccess: {result['success']}")
     print(f"Attempts: {result['attempts']}")
     print(f"Corrections: {result['corrections_made']}")
-    print(f"\nFinal Answer: {result['final_answer']}")
-    print(f"\nFinal Grading:")
-    print(f"  Faithfulness: {result['final_grading']['faithfulness']['score']:.3f}")
-    print(f"  Relevancy: {result['final_grading']['relevancy']['score']:.3f}")

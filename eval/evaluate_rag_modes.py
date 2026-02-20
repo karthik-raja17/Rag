@@ -2,6 +2,10 @@
 """
 EVALUATE SELF-CORRECTION
 Compare baseline vs self-correcting system using RAGAS test set
+Now supports three retrieval modes:
+- simple: hybrid (BM25+vector) with fixed top_k=5, no adaptive analysis
+- adaptive: adaptive retriever, no self-correction
+- adaptive-correction: adaptive retriever with self-correction
 """
 import os
 import sys
@@ -77,6 +81,23 @@ def hybrid_retrieve(vector_retriever, bm25_retriever, query_str, top_k=5):
     
     combined_nodes.sort(key=lambda x: x.score, reverse=True)
     return combined_nodes[:top_k]
+
+
+# Simple hybrid retriever (no adaptive logic)
+class SimpleHybridRetriever:
+    def __init__(self, vector_retriever, bm25_retriever, top_k=5):
+        self.vector_retriever = vector_retriever
+        self.bm25_retriever = bm25_retriever
+        self.top_k = top_k
+
+    def retrieve(self, query_bundle):
+        """Required method for query engine."""
+        return hybrid_retrieve(
+            self.vector_retriever,
+            self.bm25_retriever,
+            query_bundle.query_str,
+            top_k=self.top_k
+        )
 
 
 def load_bm25_cache(cache_dir, doc_texts, ids, metadatas, similarity_top_k=10):
@@ -164,21 +185,23 @@ def setup_retrievers():
     return vector_retriever, bm25_retriever
 
 
-def run_evaluation(test_set_path: str, enable_correction: bool = True):
+def run_evaluation(test_set_path: str, retriever_type: str):
     """
     Run evaluation on test set.
     
     Args:
         test_set_path: Path to testset CSV
-        enable_correction: Enable/disable self-correction
+        retriever_type: 'simple', 'adaptive', or 'adaptive-correction'
     
     Returns:
         DataFrame with results
     """
     load_dotenv()
     
+    enable_correction = (retriever_type == 'adaptive-correction')
+    
     print("=" * 70)
-    print(f"🧪 EVALUATION: {'Self-Correcting' if enable_correction else 'Baseline'} Mode")
+    print(f"🧪 EVALUATION: {retriever_type.replace('-', ' ').title()} Mode")
     print("=" * 70)
     
     # Load test set
@@ -186,22 +209,33 @@ def run_evaluation(test_set_path: str, enable_correction: bool = True):
     df = pd.read_csv(test_set_path)
     print(f"✅ Loaded {len(df)} test cases")
     
-    # Setup retrievers
+    # Setup retrievers (always needed)
     vector_retriever, bm25_retriever = setup_retrievers()
     
     # Setup Groq
     groq_api_key = os.getenv("GROQ_API_KEY")
     analysis_llm = Groq(api_key=groq_api_key)
     
-    # Create adaptive retriever
-    print("\n🔄 Creating adaptive retriever...")
-    adaptive_retriever = AdaptiveRetriever(
-        hybrid_retrieve_fn=hybrid_retrieve,
-        vector_retriever=vector_retriever,
-        bm25_retriever=bm25_retriever,
-        analysis_llm=analysis_llm,
-        verbose=False
-    )
+    # Create retriever based on type
+    if retriever_type == 'simple':
+        # Simple hybrid retriever (fixed top_k=5)
+        print("\n🔄 Creating simple hybrid retriever (fixed top_k=5)...")
+        retriever = SimpleHybridRetriever(
+            vector_retriever=vector_retriever,
+            bm25_retriever=bm25_retriever,
+            top_k=5
+        )
+    else:
+        # Adaptive retriever (always created, but correction may be off)
+        print("\n🔄 Creating adaptive retriever...")
+        adaptive_retriever = AdaptiveRetriever(
+            hybrid_retrieve_fn=hybrid_retrieve,
+            vector_retriever=vector_retriever,
+            bm25_retriever=bm25_retriever,
+            analysis_llm=analysis_llm,
+            verbose=False
+        )
+        retriever = adaptive_retriever
     
     # Create query engine
     print(f"🔄 Creating query engine (correction={'ON' if enable_correction else 'OFF'})...")
@@ -218,7 +252,7 @@ RULES:
 Answer concisely and clearly."""
     
     query_engine = create_self_correcting_engine(
-        retriever=adaptive_retriever,
+        retriever=retriever,
         groq_api_key=groq_api_key,
         system_prompt=system_prompt,
         enable_correction=enable_correction,
@@ -291,7 +325,7 @@ Answer concisely and clearly."""
     results_df = pd.DataFrame(results)
     
     # Save results
-    output_file = f"evaluation_results_{'corrected' if enable_correction else 'baseline'}.csv"
+    output_file = f"evaluation_results_{retriever_type}.csv"
     results_df.to_csv(output_file, index=False)
     
     print("\n" + "=" * 70)
@@ -320,33 +354,27 @@ Answer concisely and clearly."""
 
 
 def main():
-    """Run both baseline and self-correcting evaluations."""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Evaluate self-correction system')
+    parser = argparse.ArgumentParser(description='Evaluate different retrieval and correction modes')
     parser.add_argument('--test-set', type=str, default='testset_legal_simple.csv',
                        help='Path to test set CSV')
-    parser.add_argument('--mode', type=str, choices=['baseline', 'corrected', 'both'],
-                       default='both', help='Evaluation mode')
+    parser.add_argument('--retriever', type=str,
+                       choices=['simple', 'adaptive', 'adaptive-correction'],
+                       default='adaptive',
+                       help='Retriever type: simple (hybrid fixed top_k), adaptive (no correction), adaptive-correction')
     
     args = parser.parse_args()
     
-    if args.mode in ['baseline', 'both']:
-        print("\n" + "="*70)
-        print("📊 BASELINE EVALUATION (No Correction)")
-        print("="*70)
-        run_evaluation(args.test_set, enable_correction=False)
-    
-    if args.mode in ['corrected', 'both']:
-        print("\n\n" + "="*70)
-        print("📊 SELF-CORRECTING EVALUATION")
-        print("="*70)
-        run_evaluation(args.test_set, enable_correction=True)
+    run_evaluation(args.test_set, args.retriever)
     
     print("\n✅ All evaluations complete!")
     print("\nNext steps:")
-    print("1. Compare evaluation_results_baseline.csv vs evaluation_results_corrected.csv")
-    print("2. Run RAGAS metrics on both result sets")
+    print("1. Compare the generated CSV files:")
+    print("   - evaluation_results_simple.csv")
+    print("   - evaluation_results_adaptive.csv")
+    print("   - evaluation_results_adaptive-correction.csv")
+    print("2. Run RAGAS metrics on each result set")
     print("3. Analyze improvement in faithfulness and relevancy")
 
 

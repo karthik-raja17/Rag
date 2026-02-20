@@ -222,7 +222,7 @@ def main():
     
     vector_retriever = VectorIndexRetriever(
         index=index,
-        similarity_top_k=10,
+        similarity_top_k=10, #reduced from 10 to 5 for testing
         embed_model=embed_model
     )
     
@@ -301,9 +301,9 @@ def main():
         groq_api_key=groq_api_key,
         system_prompt=get_system_prompt('en'),  # Default English
         enable_correction=enable_correction,
-        max_correction_attempts=2,
-        faithfulness_threshold=0.9,
-        relevancy_threshold=0.8,
+        max_correction_attempts=1,
+        faithfulness_threshold=0.95,
+        relevancy_threshold=0.85,
         verbose=True  # Show correction process
     )
     

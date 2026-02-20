@@ -215,7 +215,12 @@ class SelfCorrectingQueryEngine(BaseQueryEngine):
         Returns:
             Generated answer string
         """
+        #truncated_contexts = [ctx[:800] for ctx in contexts[:5]] # Added for testing - limit to 5 contexts and truncate to 800 chars each
         # Format contexts
+        #context_str = "\n\n---\n\n".join(
+            #f"[CONTEXT {i+1}]\n{ctx}" for i, ctx in enumerate(truncated_contexts) # changed from contexts to truncated_contexts for testing
+        #)
+
         context_str = "\n\n---\n\n".join(
             f"[CONTEXT {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)
         )
@@ -240,6 +245,16 @@ class SelfCorrectingQueryEngine(BaseQueryEngine):
         answer = completion.choices[0].message.content.strip()
         return answer
 
+    def _get_prompt_modules(self):
+        """
+        Required by LlamaIndex BaseQueryEngine to track promptable components.
+        Since we handle prompts internally, we return an empty dict.
+        """
+        return {}
+
+    def _get_prompts(self):
+        """Optional: return any internal prompts used by the engine."""
+        return {"system_prompt": self._system_prompt}
 
 def create_self_correcting_engine(
     retriever,
@@ -271,7 +286,7 @@ def create_self_correcting_engine(
     answer_llm = GroqClient(api_key=groq_api_key)
     
     grader = AnswerGrader(
-        model_name="qwen2.5:7b",
+        model_name=groq_api_key,
         verbose=verbose
     )
     
@@ -295,17 +310,6 @@ def create_self_correcting_engine(
     )
     
     return engine
-
-def _get_prompt_modules(self):
-        """
-        Required by LlamaIndex BaseQueryEngine to track promptable components.
-        Since we handle prompts internally, we return an empty dict.
-        """
-        return {}
-
-def _get_prompts(self):
-    """Optional: return any internal prompts used by the engine."""
-    return {"system_prompt": self._system_prompt}
 
 
 # Example usage
