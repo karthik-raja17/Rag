@@ -302,8 +302,8 @@ def main():
         system_prompt=get_system_prompt('en'),  # Default English
         enable_correction=enable_correction,
         max_correction_attempts=1,
-        faithfulness_threshold=0.95,
-        relevancy_threshold=0.85,
+        faithfulness_threshold=0.6,
+        relevancy_threshold=0.5,
         verbose=True  # Show correction process
     )
     

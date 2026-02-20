@@ -153,7 +153,7 @@ class SelfCorrectingQueryEngine(BaseQueryEngine):
                 question=query_str,
                 answer=initial_answer,
                 contexts=contexts,
-                retrieval_fn=retrieval_fn
+                retrieval_fn=None # We can implement retrieval_fn if we want re-retrieval, but for now we focus on answer refinement
             )
             
             final_answer = correction_result['final_answer']
@@ -286,7 +286,7 @@ def create_self_correcting_engine(
     answer_llm = GroqClient(api_key=groq_api_key)
     
     grader = AnswerGrader(
-        model_name=groq_api_key,
+        groq_api_key=groq_api_key,
         verbose=verbose
     )
     

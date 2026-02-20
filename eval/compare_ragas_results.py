@@ -13,8 +13,8 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 
 configs = [
-    ("Simple", os.path.join(project_root, "evaluation_results_simple.csv")),
-    ("Adaptive", os.path.join(project_root, "evaluation_results_adaptive.csv")),
+    #("Simple", os.path.join(project_root, "evaluation_results_simple.csv")),
+    #("Adaptive", os.path.join(project_root, "evaluation_results_adaptive.csv")),
     ("Adaptive+Correction", os.path.join(project_root, "evaluation_results_adaptive-correction.csv")),
 ]
 
